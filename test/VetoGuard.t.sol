@@ -4,47 +4,49 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {VetoGuard, ISafeNonce} from "../src/VetoGuard.sol";
 
-/// @dev Stand-in for a Safe that exposes only the `nonce()` function the
-///      Guard needs to read. Lets us call the Guard "as a Safe" via vm.prank.
+/// @dev Stand-in Safe that exposes `nonce()`. The Guard reads it via
+///      ISafeNonce(msg.sender).nonce() during checkTransaction. We call
+///      the Guard via vm.prank from this contract's address so msg.sender
+///      = this contract = the "Safe" in the Guard's view.
 contract MockSafeWithNonce is ISafeNonce {
     uint256 public override nonce;
 
     function setNonce(uint256 n) external {
         nonce = n;
     }
-
-    function bumpNonce() external {
-        nonce += 1;
-    }
 }
 
 contract VetoGuardTest is Test {
     VetoGuard internal guard;
     MockSafeWithNonce internal safe;
+    MockSafeWithNonce internal safe2;        // a second Safe for cross-Safe isolation tests
     address internal safeAddr;
+    address internal safe2Addr;
 
-    uint256 internal vetoKey;
-    address internal vetoSigner;
-    uint256 internal newVetoKey;
-    address internal newVetoSigner;
+    uint256 internal defaultKey;
+    address internal defaultSigner;
+    uint256 internal overrideKey;
+    address internal overrideSigner;
     uint256 internal otherKey;
     address internal otherSigner;
 
     function setUp() public {
-        vetoKey = uint256(keccak256("veto-test-key"));
-        vetoSigner = vm.addr(vetoKey);
-        newVetoKey = uint256(keccak256("new-veto-test-key"));
-        newVetoSigner = vm.addr(newVetoKey);
+        defaultKey = uint256(keccak256("veto-default-key"));
+        defaultSigner = vm.addr(defaultKey);
+        overrideKey = uint256(keccak256("veto-override-key"));
+        overrideSigner = vm.addr(overrideKey);
         otherKey = uint256(keccak256("attacker-key"));
         otherSigner = vm.addr(otherKey);
 
         safe = new MockSafeWithNonce();
         safeAddr = address(safe);
-        guard = new VetoGuard(safeAddr, vetoSigner);
+        safe2 = new MockSafeWithNonce();
+        safe2Addr = address(safe2);
+        guard = new VetoGuard(defaultSigner);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Helpers — build signatures + tx hashes the way Safe does
+    // Helpers
     // ─────────────────────────────────────────────────────────────────
 
     bytes32 internal constant DOMAIN_SEPARATOR_TYPEHASH =
@@ -67,9 +69,9 @@ contract VetoGuardTest is Test {
         uint256 nonce;
     }
 
-    function _txHash(Tx memory t) internal view returns (bytes32) {
+    function _txHash(address whichSafe, Tx memory t) internal view returns (bytes32) {
         bytes32 domain = keccak256(
-            abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, safeAddr)
+            abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, whichSafe)
         );
         bytes32 structHash = keccak256(
             abi.encode(
@@ -94,9 +96,6 @@ contract VetoGuardTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    /// @dev Build the full Safe `signatures` blob: [owner_sig | veto_sig].
-    ///      For one-of-one Safes, owner_sig is 65 bytes; we just stuff a
-    ///      dummy owner sig (Safe verifies it itself; the Guard ignores it).
     function _sigsBlob(bytes memory ownerSig, bytes memory vetoSig)
         internal
         pure
@@ -123,14 +122,13 @@ contract VetoGuardTest is Test {
     }
 
     function _ownerSigDummy() internal pure returns (bytes memory) {
-        // 65 zero bytes — doesn't need to be a real signature for the
-        // Guard's tests because we're testing the Guard logic in isolation.
-        // In production, Safe verifies this against the owner's key before
-        // even calling the Guard.
         return new bytes(65);
     }
 
-    function _call(Tx memory t, bytes memory sigs) internal {
+    /// @dev Call checkTransaction as if from `whichSafe`. Uses vm.prank so
+    ///      msg.sender = whichSafe inside the Guard.
+    function _call(address whichSafe, Tx memory t, bytes memory sigs) internal {
+        vm.prank(whichSafe);
         guard.checkTransaction(
             t.to,
             t.value,
@@ -147,15 +145,26 @@ contract VetoGuardTest is Test {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Happy path
+    // Default signer + happy path
     // ─────────────────────────────────────────────────────────────────
 
-    function test_happy_path_allows_with_valid_veto_signature() public {
+    function test_default_signer_set_at_construction() public {
+        assertEq(guard.defaultVetoSigner(), defaultSigner);
+        // Unregistered Safe inherits the default.
+        assertEq(guard.effectiveSigner(safeAddr), defaultSigner);
+    }
+
+    function test_constructor_rejects_zero_address() public {
+        vm.expectRevert(VetoGuard.ZeroAddress.selector);
+        new VetoGuard(address(0));
+    }
+
+    function test_happy_path_allows_with_default_signer() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        bytes32 h = _txHash(t);
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(vetoKey, h));
-        _call(t, sigs); // must not revert
+        bytes32 h = _txHash(safeAddr, t);
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, h));
+        _call(safeAddr, t, sigs); // must not revert
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -165,26 +174,22 @@ contract VetoGuardTest is Test {
     function test_reverts_when_only_owner_sig_present() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        // Only 65 bytes — no Veto sig appended.
-        bytes memory sigs = _ownerSigDummy();
         vm.expectRevert(VetoGuard.VetoSignatureMissing.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, _ownerSigDummy());
     }
 
     function test_reverts_when_signatures_empty() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
         vm.expectRevert(VetoGuard.VetoSignatureMissing.selector);
-        _call(t, "");
+        _call(safeAddr, t, "");
     }
 
     function test_reverts_when_signatures_truncated() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        // 129 bytes — one byte short of having a Veto sig.
-        bytes memory sigs = new bytes(129);
         vm.expectRevert(VetoGuard.VetoSignatureMissing.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, new bytes(129));
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -194,148 +199,126 @@ contract VetoGuardTest is Test {
     function test_reverts_when_veto_sig_from_random_key() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        bytes32 h = _txHash(t);
+        bytes32 h = _txHash(safeAddr, t);
         bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(otherKey, h));
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, sigs);
     }
 
     function test_reverts_when_veto_sig_for_different_tx() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        // Sign a DIFFERENT tx hash than the one being checked.
         Tx memory otherTx = _defaultTx();
         otherTx.value = 999 ether;
-        bytes32 otherHash = _txHash(otherTx);
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(vetoKey, otherHash));
+        bytes32 otherHash = _txHash(safeAddr, otherTx);
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, otherHash));
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, sigs);
     }
 
     function test_reverts_when_veto_sig_garbage() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        // 65 bytes of zeros — ecrecover returns address(0) → invalid.
-        bytes memory junkSig = new bytes(65);
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), junkSig);
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), new bytes(65));
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, sigs);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Replay protection — relies on Safe's nonce being in the hash
+    // Replay protection (Safe nonce + per-Safe domain)
     // ─────────────────────────────────────────────────────────────────
 
     function test_replay_with_stale_nonce_fails() public {
-        // Sign a tx for nonce=0.
         Tx memory t = _defaultTx();
         t.nonce = 0;
-        bytes32 h = _txHash(t);
-        bytes memory vetoSig = _sign(vetoKey, h);
-
-        // Safe has now advanced to nonce=1. The Guard reads current nonce
-        // and recomputes the hash with nonce=1, so the stored sig won't
-        // match.
+        bytes32 h = _txHash(safeAddr, t);
+        bytes memory vetoSig = _sign(defaultKey, h);
         safe.setNonce(1);
-
         bytes memory sigs = _sigsBlob(_ownerSigDummy(), vetoSig);
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, sigs);
     }
 
     function test_two_distinct_nonces_both_pass_with_distinct_sigs() public {
-        // nonce 0 → fresh sig → allow
         Tx memory t0 = _defaultTx();
         t0.nonce = 0;
         safe.setNonce(0);
-        _call(t0, _sigsBlob(_ownerSigDummy(), _sign(vetoKey, _txHash(t0))));
+        _call(safeAddr, t0, _sigsBlob(_ownerSigDummy(), _sign(defaultKey, _txHash(safeAddr, t0))));
 
-        // bump nonce, re-sign for nonce 1, allow
         safe.setNonce(1);
         Tx memory t1 = _defaultTx();
         t1.nonce = 1;
-        _call(t1, _sigsBlob(_ownerSigDummy(), _sign(vetoKey, _txHash(t1))));
+        _call(safeAddr, t1, _sigsBlob(_ownerSigDummy(), _sign(defaultKey, _txHash(safeAddr, t1))));
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // Cross-chain replay protection — chainId is in the domain separator
-    // ─────────────────────────────────────────────────────────────────
+    function test_signature_for_other_safe_fails() public {
+        // Sign for safe2 but invoke from safe.
+        Tx memory t = _defaultTx();
+        safe.setNonce(t.nonce);
+        bytes32 hSafe2 = _txHash(safe2Addr, t);
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, hSafe2));
+        vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
+        _call(safeAddr, t, sigs);
+    }
 
     function test_signature_from_other_chain_fails() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
 
-        // Sign a hash computed with a DIFFERENT chainId.
         bytes32 foreignDomain = keccak256(
             abi.encode(DOMAIN_SEPARATOR_TYPEHASH, uint256(999), safeAddr)
         );
         bytes32 structHash = keccak256(
             abi.encode(
                 SAFE_TX_TYPEHASH,
-                t.to,
-                t.value,
-                keccak256(t.data),
-                t.operation,
-                t.safeTxGas,
-                t.baseGas,
-                t.gasPrice,
-                t.gasToken,
-                t.refundReceiver,
-                t.nonce
+                t.to, t.value, keccak256(t.data),
+                t.operation, t.safeTxGas, t.baseGas, t.gasPrice,
+                t.gasToken, t.refundReceiver, t.nonce
             )
         );
         bytes32 foreignHash = keccak256(
             abi.encodePacked("\x19\x01", foreignDomain, structHash)
         );
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(vetoKey, foreignHash));
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, foreignHash));
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, sigs);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Cross-Safe replay protection — Safe address is in the domain
+    // Per-Safe isolation — two Safes, independent configs
     // ─────────────────────────────────────────────────────────────────
 
-    function test_signature_for_other_safe_fails() public {
+    function test_two_safes_use_default_independently() public {
         Tx memory t = _defaultTx();
-        safe.setNonce(t.nonce);
+        safe.setNonce(0);
+        safe2.setNonce(0);
 
-        // Sign a hash computed for a DIFFERENT Safe address.
-        address otherSafe = address(0xDEAD);
-        bytes32 foreignDomain = keccak256(
-            abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, otherSafe)
-        );
-        bytes32 structHash = keccak256(
-            abi.encode(
-                SAFE_TX_TYPEHASH,
-                t.to,
-                t.value,
-                keccak256(t.data),
-                t.operation,
-                t.safeTxGas,
-                t.baseGas,
-                t.gasPrice,
-                t.gasToken,
-                t.refundReceiver,
-                t.nonce
-            )
-        );
-        bytes32 foreignHash = keccak256(
-            abi.encodePacked("\x19\x01", foreignDomain, structHash)
-        );
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(vetoKey, foreignHash));
-        vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, _sigsBlob(_ownerSigDummy(), _sign(defaultKey, _txHash(safeAddr, t))));
+        _call(safe2Addr, t, _sigsBlob(_ownerSigDummy(), _sign(defaultKey, _txHash(safe2Addr, t))));
+    }
+
+    function test_safe_a_rotation_does_not_affect_safe_b() public {
+        // Safe A rotates to overrideSigner.
+        vm.prank(safeAddr);
+        guard.requestSignerRotation(overrideSigner);
+        vm.warp(block.timestamp + 14 days);
+        guard.executeSignerRotation(safeAddr);
+
+        // Safe A now requires overrideSigner.
+        Tx memory t = _defaultTx();
+        safe.setNonce(0);
+        bytes memory aSigs = _sigsBlob(_ownerSigDummy(), _sign(overrideKey, _txHash(safeAddr, t)));
+        _call(safeAddr, t, aSigs);
+
+        // Safe B still uses the default.
+        safe2.setNonce(0);
+        bytes memory bSigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, _txHash(safe2Addr, t)));
+        _call(safe2Addr, t, bSigs);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Signer rotation (timelock)
+    // Signer rotation (per-Safe timelock)
     // ─────────────────────────────────────────────────────────────────
-
-    function test_rotation_requires_safe_caller() public {
-        vm.expectRevert(VetoGuard.NotSafeOwner.selector);
-        guard.requestSignerRotation(newVetoSigner);
-    }
 
     function test_rotation_revert_on_zero_address() public {
         vm.prank(safeAddr);
@@ -345,7 +328,7 @@ contract VetoGuardTest is Test {
 
     function test_rotation_revert_when_already_pending() public {
         vm.prank(safeAddr);
-        guard.requestSignerRotation(newVetoSigner);
+        guard.requestSignerRotation(overrideSigner);
         vm.prank(safeAddr);
         vm.expectRevert(VetoGuard.RotationAlreadyPending.selector);
         guard.requestSignerRotation(otherSigner);
@@ -353,84 +336,88 @@ contract VetoGuardTest is Test {
 
     function test_rotation_revert_before_timelock() public {
         vm.prank(safeAddr);
-        guard.requestSignerRotation(newVetoSigner);
-        // 13 days later — still locked
+        guard.requestSignerRotation(overrideSigner);
         vm.warp(block.timestamp + 13 days);
         vm.expectRevert(VetoGuard.RotationTimelockActive.selector);
-        guard.executeSignerRotation();
+        guard.executeSignerRotation(safeAddr);
     }
 
     function test_rotation_succeeds_after_timelock() public {
         vm.prank(safeAddr);
-        guard.requestSignerRotation(newVetoSigner);
+        guard.requestSignerRotation(overrideSigner);
         vm.warp(block.timestamp + 14 days);
-        guard.executeSignerRotation();
-        assertEq(guard.vetoSigner(), newVetoSigner);
-        assertEq(guard.pendingSigner(), address(0));
+        guard.executeSignerRotation(safeAddr);
+        (address signer, address pending, , ) = guard.configs(safeAddr);
+        assertEq(signer, overrideSigner);
+        assertEq(pending, address(0));
+        assertEq(guard.effectiveSigner(safeAddr), overrideSigner);
     }
 
     function test_rotation_cancel() public {
         vm.prank(safeAddr);
-        guard.requestSignerRotation(newVetoSigner);
+        guard.requestSignerRotation(overrideSigner);
         vm.prank(safeAddr);
         guard.cancelSignerRotation();
-        assertEq(guard.pendingSigner(), address(0));
-        // Now executing should fail.
+        (, address pending, , ) = guard.configs(safeAddr);
+        assertEq(pending, address(0));
         vm.expectRevert(VetoGuard.RotationNotPending.selector);
-        guard.executeSignerRotation();
+        guard.executeSignerRotation(safeAddr);
     }
 
-    function test_after_rotation_old_signer_rejected() public {
-        // Rotate signer.
+    function test_after_rotation_default_signer_rejected() public {
         vm.prank(safeAddr);
-        guard.requestSignerRotation(newVetoSigner);
+        guard.requestSignerRotation(overrideSigner);
         vm.warp(block.timestamp + 14 days);
-        guard.executeSignerRotation();
+        guard.executeSignerRotation(safeAddr);
 
-        // Old signer's sig no longer works.
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        bytes32 h = _txHash(t);
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(vetoKey, h));
+        bytes32 h = _txHash(safeAddr, t);
+
+        // Default signer (the deploy-time one) no longer works for this Safe.
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, h));
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, sigs);
 
-        // New signer's sig works.
-        sigs = _sigsBlob(_ownerSigDummy(), _sign(newVetoKey, h));
-        _call(t, sigs);
+        // Override signer does.
+        sigs = _sigsBlob(_ownerSigDummy(), _sign(overrideKey, h));
+        _call(safeAddr, t, sigs);
+    }
+
+    function test_rotation_execute_callable_by_anyone() public {
+        vm.prank(safeAddr);
+        guard.requestSignerRotation(overrideSigner);
+        vm.warp(block.timestamp + 14 days);
+        vm.prank(otherSigner);
+        guard.executeSignerRotation(safeAddr);
+        assertEq(guard.effectiveSigner(safeAddr), overrideSigner);
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Escape hatch
+    // Escape hatch (per-Safe)
     // ─────────────────────────────────────────────────────────────────
-
-    function test_escape_requires_safe_caller() public {
-        vm.expectRevert(VetoGuard.NotSafeOwner.selector);
-        guard.requestEscape();
-    }
 
     function test_escape_before_timelock_still_enforces() public {
         vm.prank(safeAddr);
         guard.requestEscape();
         vm.warp(block.timestamp + 13 days);
-        // Still enforced — escape hasn't elapsed.
-        assertFalse(guard.isEscaped());
+        assertFalse(guard.isEscaped(safeAddr));
+
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
         vm.expectRevert(VetoGuard.VetoSignatureMissing.selector);
-        _call(t, _ownerSigDummy());
+        _call(safeAddr, t, _ownerSigDummy());
     }
 
     function test_escape_after_timelock_is_no_op() public {
         vm.prank(safeAddr);
         guard.requestEscape();
         vm.warp(block.timestamp + 14 days);
-        assertTrue(guard.isEscaped());
+        assertTrue(guard.isEscaped(safeAddr));
 
-        // Now checkTransaction passes with NO Veto sig — owner can detach.
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        _call(t, _ownerSigDummy()); // must not revert
+        _call(safeAddr, t, _ownerSigDummy()); // must not revert
     }
 
     function test_escape_cancel() public {
@@ -438,15 +425,15 @@ contract VetoGuardTest is Test {
         guard.requestEscape();
         vm.prank(safeAddr);
         guard.cancelEscape();
-        assertEq(guard.escapeUnlockAt(), 0);
+        (, , , uint256 escapeUnlock) = guard.configs(safeAddr);
+        assertEq(escapeUnlock, 0);
 
-        // Even after 14 days, no escape because it was cancelled.
         vm.warp(block.timestamp + 14 days);
-        assertFalse(guard.isEscaped());
+        assertFalse(guard.isEscaped(safeAddr));
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
         vm.expectRevert(VetoGuard.VetoSignatureMissing.selector);
-        _call(t, _ownerSigDummy());
+        _call(safeAddr, t, _ownerSigDummy());
     }
 
     function test_escape_already_pending() public {
@@ -463,120 +450,55 @@ contract VetoGuardTest is Test {
         guard.cancelEscape();
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // Adversarial — things I'd try if I were attacking this contract
-    // ─────────────────────────────────────────────────────────────────
-
-    /// @dev If an attacker reuses a Veto sig from a prior tx (same nonce
-    ///      same hash), the Guard would accept it — but Safe itself won't
-    ///      let the same nonce execute twice. So even if the Guard passes,
-    ///      Safe reverts. This test documents that Safe is the canonical
-    ///      replay defense; the Guard just enforces "Veto signed THIS
-    ///      version of THIS nonce."
-    function test_same_nonce_replay_at_guard_layer_passes_but_safe_blocks() public {
-        Tx memory t = _defaultTx();
-        safe.setNonce(0);
-        bytes32 h = _txHash(t);
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(vetoKey, h));
-
-        // First call: Guard accepts.
-        _call(t, sigs);
-
-        // Second call with the SAME nonce: Guard also accepts (it's stateless).
-        // In production, Safe would have already incremented the nonce and
-        // would reject the second execTransaction. We document this is the
-        // intentional separation of concerns.
-        _call(t, sigs);
-    }
-
-    /// @dev Signature with v=0 or v=1 (legacy/non-canonical) should not
-    ///      recover to the Veto signer unless they actually signed it.
-    ///      OpenZeppelin's ECDSA has a malleability check; we rely on
-    ///      ecrecover returning a different address (or zero) for malleated
-    ///      sigs, which fails the equality check.
-    function test_malformed_v_byte_does_not_match_signer() public {
-        Tx memory t = _defaultTx();
-        safe.setNonce(t.nonce);
-        bytes32 h = _txHash(t);
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(vetoKey, h);
-        // Corrupt v.
-        v = v == 27 ? 28 : 27;
-        bytes memory badSig = abi.encodePacked(r, s, v);
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), badSig);
-        vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
-    }
-
-    /// @dev Front-running the executeSignerRotation: anyone can call it
-    ///      after the timelock. That's fine because it's idempotent and
-    ///      the new signer is what the owner already requested. Confirm.
-    function test_rotation_execute_callable_by_anyone() public {
-        vm.prank(safeAddr);
-        guard.requestSignerRotation(newVetoSigner);
-        vm.warp(block.timestamp + 14 days);
-
-        // Non-owner calls — should still succeed.
-        vm.prank(otherSigner);
-        guard.executeSignerRotation();
-        assertEq(guard.vetoSigner(), newVetoSigner);
-    }
-
-    /// @dev Escape hatch state can be toggled but cannot be silently
-    ///      revoked once unlocked — only by an explicit cancelEscape AFTER
-    ///      the timelock elapses, the Guard returns true from isEscaped().
-    ///      Once isEscaped(), the only way to re-engage Veto's protection
-    ///      is to detach this Guard entirely and install a fresh one. Test
-    ///      that explicit cancel after elapse still has effect (resets
-    ///      the state so future requests start cleanly).
-    function test_escape_can_be_cancelled_after_elapse() public {
+    function test_safe_a_escape_does_not_affect_safe_b() public {
         vm.prank(safeAddr);
         guard.requestEscape();
         vm.warp(block.timestamp + 14 days);
-        assertTrue(guard.isEscaped());
+        assertTrue(guard.isEscaped(safeAddr));
+        assertFalse(guard.isEscaped(safe2Addr));
 
-        // Cancel even though elapsed — escape state cleared.
-        vm.prank(safeAddr);
-        guard.cancelEscape();
-        assertFalse(guard.isEscaped());
-
-        // Enforcement back on.
+        // Safe B still enforced.
         Tx memory t = _defaultTx();
-        safe.setNonce(t.nonce);
+        safe2.setNonce(0);
         vm.expectRevert(VetoGuard.VetoSignatureMissing.selector);
-        _call(t, _ownerSigDummy());
+        _call(safe2Addr, t, _ownerSigDummy());
     }
 
-    /// @dev Owner cannot bypass enforcement by calling checkTransaction
-    ///      directly. It's a view function callable by anyone, but the
-    ///      "anyone" is decorative — only Safe's own execTransaction path
-    ///      will route through it. Verifying anyway: a direct call from
-    ///      a random EOA with a fake Veto sig still must satisfy the
-    ///      cryptographic check.
-    function test_direct_call_from_eoa_still_requires_real_signature() public {
+    // ─────────────────────────────────────────────────────────────────
+    // Adversarial
+    // ─────────────────────────────────────────────────────────────────
+
+    function test_malformed_v_byte_does_not_match_signer() public {
         Tx memory t = _defaultTx();
         safe.setNonce(t.nonce);
-        // Attacker forges a "sig" but doesn't have the Veto key.
-        bytes memory forgedSig = abi.encodePacked(
-            bytes32(uint256(1)),
-            bytes32(uint256(2)),
-            uint8(27)
-        );
-        bytes memory sigs = _sigsBlob(_ownerSigDummy(), forgedSig);
-        vm.prank(otherSigner); // attacker calls
+        bytes32 h = _txHash(safeAddr, t);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(defaultKey, h);
+        v = v == 27 ? 28 : 27;
+        bytes memory badSig = abi.encodePacked(r, s, v);
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        _call(t, sigs);
+        _call(safeAddr, t, _sigsBlob(_ownerSigDummy(), badSig));
+    }
+
+    function test_direct_call_from_eoa_treats_eoa_as_unknown_safe() public {
+        // If an EOA calls checkTransaction directly with a sig that
+        // would validate against itself-as-safe... well, the EOA can't
+        // be a Safe (no nonce() function), so the call should revert.
+        Tx memory t = _defaultTx();
+        bytes memory sigs = _sigsBlob(_ownerSigDummy(), _sign(defaultKey, _txHash(otherSigner, t)));
+        vm.prank(otherSigner);
+        // ISafeNonce(otherSigner).nonce() reverts because the EOA has no code.
+        vm.expectRevert();
+        guard.checkTransaction(
+            t.to, t.value, t.data, t.operation, t.safeTxGas, t.baseGas,
+            t.gasPrice, t.gasToken, t.refundReceiver, sigs, address(this)
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Fuzz tests — random hashes shouldn't accidentally validate
+    // Fuzz
     // ─────────────────────────────────────────────────────────────────
 
-    function testFuzz_random_signatures_dont_validate(
-        bytes32 r,
-        bytes32 s,
-        uint8 v
-    ) public {
-        // Skip degenerate v values; ecrecover returns 0 for those anyway.
+    function testFuzz_random_signatures_dont_validate(bytes32 r, bytes32 s, uint8 v) public {
         if (v != 27 && v != 28) v = 27;
 
         Tx memory t = _defaultTx();
@@ -584,17 +506,14 @@ contract VetoGuardTest is Test {
         bytes memory fuzzedSig = abi.encodePacked(r, s, v);
         bytes memory sigs = _sigsBlob(_ownerSigDummy(), fuzzedSig);
 
-        // Recover what this fuzz sig points at.
-        bytes32 h = _txHash(t);
+        bytes32 h = _txHash(safeAddr, t);
         address recovered = ecrecover(h, v, r, s);
 
-        // If by infinitesimal chance the random sig recovers to our
-        // vetoSigner, the call WOULD succeed. Otherwise it must revert.
-        if (recovered == vetoSigner && recovered != address(0)) {
-            _call(t, sigs);
+        if (recovered == defaultSigner && recovered != address(0)) {
+            _call(safeAddr, t, sigs);
         } else {
             vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-            _call(t, sigs);
+            _call(safeAddr, t, sigs);
         }
     }
 }

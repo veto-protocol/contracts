@@ -68,16 +68,13 @@ contract VetoGuardBridgeTest is Test {
     bytes internal constant OWNER_SIG_PLACEHOLDER = new bytes(65);
 
     function setUp() public {
-        // Mock Safe's runtime address must match the fixture so the
-        // EIP-712 domain separator matches (it's keyed off the
-        // verifyingContract = safe address).
+        // Singleton Guard — one contract, any Safe calls into it.
+        // FIXTURE_SIGNER is the default signer baked in at deploy.
+        guard = new VetoGuard(FIXTURE_SIGNER);
+        // Spin up a mock Safe template; we vm.etch it into the fixture
+        // address per-test so msg.sender matches what Python signed.
         safe = new MockSafeWithNonce();
         safeAddr = address(safe);
-        // We deploy the Guard expecting the *same* signer Python produced.
-        // The Guard's `safe` is whatever address Safe was deployed at; we
-        // override Python's fixture address mismatch by recomputing the
-        // expected hash against `safeAddr` and comparing.
-        guard = new VetoGuard(safeAddr, FIXTURE_SIGNER);
     }
 
     // ─── 1. Pin chainId so the fixture's domain separator matches ──
@@ -100,27 +97,18 @@ contract VetoGuardBridgeTest is Test {
     /// SAME safe address Python used, the Guard's recomputed hash must
     /// equal Python's FIXTURE_TX_HASH. Catches encoding drift even
     /// before any signature is involved.
-    function test_python_hash_matches_solidity_hash_for_fixture() public {
-        _pinChain();
-        // Deploy a Guard whose `safe` equals the fixture address, so
-        // the domain separator hashes to the same bytes Python did.
-        VetoGuard sameSafe = new VetoGuard(FIXTURE_SAFE_ADDR, FIXTURE_SIGNER);
-        // We can't call private _safeTxHash, so we exercise it via
-        // checkTransaction: deploy a mock safe at exactly FIXTURE_SAFE_ADDR
-        // and have it return the fixture nonce; if the Guard accepts the
-        // fixture sig, then the hash equality holds.
-        // We can't change a contract's address — but we can vm.etch the
-        // MockSafeWithNonce bytecode INTO the fixture address.
+    /// @dev Plant a mock Safe at the fixture address and return its code etch'd in.
+    function _plantFixtureSafe(uint256 nonce) internal {
         MockSafeWithNonce template = new MockSafeWithNonce();
         vm.etch(FIXTURE_SAFE_ADDR, address(template).code);
-        MockSafeWithNonce(FIXTURE_SAFE_ADDR).setNonce(FIXTURE_NONCE);
+        MockSafeWithNonce(FIXTURE_SAFE_ADDR).setNonce(nonce);
+    }
 
-        bytes memory sigs = _signaturesBlob(FIXTURE_SIGNATURE);
-
-        // Should not revert — Python's sig and the Solidity hash agree.
-        sameSafe.checkTransaction(
-            FIXTURE_TO_ADDR,
-            FIXTURE_VALUE,
+    function _callAsFixtureSafe(uint256 value, address to, bytes memory sigs) internal {
+        vm.prank(FIXTURE_SAFE_ADDR);
+        guard.checkTransaction(
+            to,
+            value,
             "",
             FIXTURE_OPERATION,
             0, 0, 0,
@@ -131,98 +119,45 @@ contract VetoGuardBridgeTest is Test {
         );
     }
 
-    /// Mutate a single field — sig must now fail. Confirms each field
-    /// is actually committed to in the hash (not silently ignored).
-    function test_mutated_value_breaks_fixture_signature() public {
+    function test_python_hash_matches_solidity_hash_for_fixture() public {
         _pinChain();
-        MockSafeWithNonce template = new MockSafeWithNonce();
-        vm.etch(FIXTURE_SAFE_ADDR, address(template).code);
-        MockSafeWithNonce(FIXTURE_SAFE_ADDR).setNonce(FIXTURE_NONCE);
-        VetoGuard sameSafe = new VetoGuard(FIXTURE_SAFE_ADDR, FIXTURE_SIGNER);
-
+        _plantFixtureSafe(FIXTURE_NONCE);
         bytes memory sigs = _signaturesBlob(FIXTURE_SIGNATURE);
 
-        // Bumping `value` by 1 changes the hash → sig recovers to a
-        // different (or zero) address → invalid.
+        // Should not revert — Python's sig and the Solidity hash agree.
+        _callAsFixtureSafe(FIXTURE_VALUE, FIXTURE_TO_ADDR, sigs);
+    }
+
+    function test_mutated_value_breaks_fixture_signature() public {
+        _pinChain();
+        _plantFixtureSafe(FIXTURE_NONCE);
+        bytes memory sigs = _signaturesBlob(FIXTURE_SIGNATURE);
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        sameSafe.checkTransaction(
-            FIXTURE_TO_ADDR,
-            FIXTURE_VALUE + 1, // changed
-            "",
-            FIXTURE_OPERATION,
-            0, 0, 0,
-            address(0),
-            payable(address(0)),
-            sigs,
-            address(this)
-        );
+        _callAsFixtureSafe(FIXTURE_VALUE + 1, FIXTURE_TO_ADDR, sigs);
     }
 
     function test_mutated_nonce_breaks_fixture_signature() public {
         _pinChain();
-        MockSafeWithNonce template = new MockSafeWithNonce();
-        vm.etch(FIXTURE_SAFE_ADDR, address(template).code);
-        // Use the WRONG nonce.
-        MockSafeWithNonce(FIXTURE_SAFE_ADDR).setNonce(FIXTURE_NONCE + 1);
-        VetoGuard sameSafe = new VetoGuard(FIXTURE_SAFE_ADDR, FIXTURE_SIGNER);
-
+        _plantFixtureSafe(FIXTURE_NONCE + 1); // wrong nonce
         bytes memory sigs = _signaturesBlob(FIXTURE_SIGNATURE);
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        sameSafe.checkTransaction(
-            FIXTURE_TO_ADDR,
-            FIXTURE_VALUE,
-            "",
-            FIXTURE_OPERATION,
-            0, 0, 0,
-            address(0),
-            payable(address(0)),
-            sigs,
-            address(this)
-        );
+        _callAsFixtureSafe(FIXTURE_VALUE, FIXTURE_TO_ADDR, sigs);
     }
 
     function test_mutated_chainid_breaks_fixture_signature() public {
-        // DON'T pin chainId — Foundry's default chainId differs from
-        // the fixture's 84532, so the domain separator mismatches.
-        MockSafeWithNonce template = new MockSafeWithNonce();
-        vm.etch(FIXTURE_SAFE_ADDR, address(template).code);
-        MockSafeWithNonce(FIXTURE_SAFE_ADDR).setNonce(FIXTURE_NONCE);
-        VetoGuard sameSafe = new VetoGuard(FIXTURE_SAFE_ADDR, FIXTURE_SIGNER);
-
+        // DON'T pin chainId — Foundry's default differs from 84532,
+        // so the domain separator mismatches.
+        _plantFixtureSafe(FIXTURE_NONCE);
         bytes memory sigs = _signaturesBlob(FIXTURE_SIGNATURE);
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        sameSafe.checkTransaction(
-            FIXTURE_TO_ADDR,
-            FIXTURE_VALUE,
-            "",
-            FIXTURE_OPERATION,
-            0, 0, 0,
-            address(0),
-            payable(address(0)),
-            sigs,
-            address(this)
-        );
+        _callAsFixtureSafe(FIXTURE_VALUE, FIXTURE_TO_ADDR, sigs);
     }
 
     function test_mutated_to_address_breaks_fixture_signature() public {
         _pinChain();
-        MockSafeWithNonce template = new MockSafeWithNonce();
-        vm.etch(FIXTURE_SAFE_ADDR, address(template).code);
-        MockSafeWithNonce(FIXTURE_SAFE_ADDR).setNonce(FIXTURE_NONCE);
-        VetoGuard sameSafe = new VetoGuard(FIXTURE_SAFE_ADDR, FIXTURE_SIGNER);
-
+        _plantFixtureSafe(FIXTURE_NONCE);
         bytes memory sigs = _signaturesBlob(FIXTURE_SIGNATURE);
         vm.expectRevert(VetoGuard.VetoSignatureInvalid.selector);
-        sameSafe.checkTransaction(
-            address(0xDEAD), // changed
-            FIXTURE_VALUE,
-            "",
-            FIXTURE_OPERATION,
-            0, 0, 0,
-            address(0),
-            payable(address(0)),
-            sigs,
-            address(this)
-        );
+        _callAsFixtureSafe(FIXTURE_VALUE, address(0xDEAD), sigs);
     }
 }
