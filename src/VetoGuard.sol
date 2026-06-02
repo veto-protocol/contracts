@@ -153,6 +153,17 @@ contract VetoGuard {
 
     function checkAfterExecution(bytes32 /* txHash */, bool /* success */) external pure {}
 
+    /// @notice ERC-165 — REQUIRED by Safe ≥1.3.0 `setGuard`, which calls
+    ///         `Guard(guard).supportsInterface(type(Guard).interfaceId)` and
+    ///         reverts (GS013) if it isn't supported. Without this, no Safe can
+    ///         ever install this guard. Must return true for the Guard interface
+    ///         (checkTransaction ^ checkAfterExecution = 0xe6d7a83a) and ERC-165.
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return
+            interfaceId == 0xe6d7a83a || // type(Guard).interfaceId
+            interfaceId == 0x01ffc9a7;   // type(IERC165).interfaceId
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Per-Safe admin — only callable through the Safe's own execTransaction
     // (the Safe is msg.sender, having already verified the owner's sig).
