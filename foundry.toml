@@ -15,7 +15,13 @@ fuzz = { runs = 256 }
 [rpc_endpoints]
 base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
 base = "${BASE_RPC_URL}"
+# SKALE on Base — public RPCs (no key needed). Mainnet chainId 1187947933, testnet 324705682.
+skale_base_sepolia = "https://base-sepolia-testnet.skalenodes.com/v1/jubilant-horrible-ancha"
+skale_base = "https://skale-base.skalenodes.com/v1/base"
 
 [etherscan]
 base_sepolia = { key = "${BASESCAN_API_KEY}", url = "https://api-sepolia.basescan.org/api" }
 base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
+# SKALE uses Blockscout explorers (no API key). Verify with --verifier blockscout --verifier-url <explorer>/api/
+# Mainnet explorer: https://skale-base-explorer.skalenodes.com/  (testnet explorer URL: TODO confirm)
+skale_base = { key = "any", url = "https://skale-base-explorer.skalenodes.com/api/", chain = 1187947933 }

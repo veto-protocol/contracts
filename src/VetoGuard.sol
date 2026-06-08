@@ -132,7 +132,12 @@ contract VetoGuard {
         // Escape elapsed → no enforcement. Owner can now call setGuard(0).
         if (cfg.escapeUnlockAt != 0 && block.timestamp >= cfg.escapeUnlockAt) return;
 
-        uint256 nonce = ISafeNonce(safe).nonce();
+        // Safe.execTransaction increments `nonce` BEFORE invoking this guard
+        // hook, so the live nonce is one past the tx being authorized. The owner
+        // and the Veto co-signer both sign over the tx's actual nonce, so we must
+        // subtract one to recompute the same SafeTx hash they signed. (A guarded
+        // execTransaction always has nonce >= 1 here, so this never underflows.)
+        uint256 nonce = ISafeNonce(safe).nonce() - 1;
         bytes32 txHash = _safeTxHash(
             safe, to, value, data, operation, safeTxGas, baseGas,
             gasPrice, gasToken, refundReceiver, nonce
